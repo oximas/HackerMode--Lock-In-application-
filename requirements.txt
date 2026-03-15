@@ -1,0 +1,4 @@
+PyQt6
+pywin32
+requests
+psutil
