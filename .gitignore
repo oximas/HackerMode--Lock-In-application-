@@ -1,2 +1,4 @@
 *.json
 *.jpg
+*.pyc
+*.zip

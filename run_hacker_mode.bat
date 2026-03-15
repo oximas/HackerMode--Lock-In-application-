@@ -19,6 +19,6 @@ pip install PyQt6 pywin32 requests
 echo.
 echo [2/2] Launching HackerMode...
 echo.
-python HackerMode.py
+python hacker_mode.py
 
 pause
