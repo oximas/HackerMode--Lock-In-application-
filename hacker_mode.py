@@ -17,7 +17,7 @@ from ui import LockScreen
 
 
 def main():
-    register_startup()
+    register_startup(script_path=os.path.abspath(__file__))
     ensure_azkar_image()
 
     install_hook()

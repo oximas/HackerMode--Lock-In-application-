@@ -21,21 +21,26 @@ from core import (
     # config
     APP_NAME, ANKI_PATH, AZKAR_LOCAL_PATH, AZKAR_SOURCE_PATH,
     REQUIRED_REVIEWS, PLAY_SOUND,
+    WEBSITE_URL, WEBSITE_TASK_DURATION_SEC,
     # hook
-    remove_hook,
+    remove_hook, install_hook, pump_messages,
     # watchers
-    AnkiWatcher, AzkarWindowWatcher,
+    AnkiWatcher, AzkarWindowWatcher, WebsiteWatcher,
     # persistence
     azkar_done_today, mark_azkar_done, unmark_azkar_done,
+    website_done_today, mark_website_done,
     mark_today_complete, calculate_streak,
 )
+
+# Total number of tasks — update this when adding more tasks
+TOTAL_TASKS = 3
 
 
 # ─────────────────────────────────────────────
 #  TASK ROW WIDGET
 # ─────────────────────────────────────────────
 class TaskRow(QFrame):
-    def __init__(self, icon: str, name: str, description: str):
+    def __init__(self, icon: str, name: str, description: str, show_bar: bool = False, bar_max: int = 100):
         super().__init__()
         self.setObjectName("taskRow")
         self._done = False
@@ -68,12 +73,13 @@ class TaskRow(QFrame):
         self.status_label.setFixedWidth(90)
 
         self.mini_bar = QProgressBar()
-        self.mini_bar.setRange(0, REQUIRED_REVIEWS)
+        self.mini_bar.setRange(0, bar_max)
         self.mini_bar.setValue(0)
         self.mini_bar.setFixedHeight(6)
         self.mini_bar.setFixedWidth(120)
         self.mini_bar.setTextVisible(False)
         self.mini_bar.setObjectName("miniBar")
+        self.mini_bar.setVisible(show_bar)
 
         right_col = QVBoxLayout()
         right_col.setSpacing(4)
@@ -88,6 +94,16 @@ class TaskRow(QFrame):
         self.mini_bar.setMaximum(total)
         self.mini_bar.setValue(min(value, total))
         self.desc_label.setText(f"{value}/{total} cards reviewed today")
+
+    def update_countdown(self, remaining: int, total: int):
+        """Update desc + mini_bar for countdown-style tasks (website)."""
+        self.mini_bar.setMaximum(total)
+        self.mini_bar.setValue(remaining)   # bar drains left→right as time passes
+        mins, secs = divmod(remaining, 60)
+        if mins > 0:
+            self.desc_label.setText(f"⏱  {mins}m {secs:02d}s remaining — stay on the page")
+        else:
+            self.desc_label.setText(f"⏱  {secs}s remaining — stay on the page")
 
     def mark_done(self):
         self._done = True
@@ -112,7 +128,7 @@ class LockScreen(QMainWindow):
         self._setup_window()
         self._build_ui()
         self._apply_stylesheet()
-        self._start_watcher()
+        self._start_watchers()
 
     # ── Window setup ──────────────────────────
     def _setup_window(self):
@@ -197,7 +213,12 @@ class LockScreen(QMainWindow):
         card_layout.addWidget(divider)
         card_layout.addSpacing(8)
 
-        self.anki_row = TaskRow("🗃", "Anki Reviews", f"0/{REQUIRED_REVIEWS} cards reviewed today")
+        # Anki row
+        self.anki_row = TaskRow(
+            "🗃", "Anki Reviews",
+            f"0/{REQUIRED_REVIEWS} cards reviewed today",
+            show_bar=True, bar_max=REQUIRED_REVIEWS
+        )
         card_layout.addWidget(self.anki_row)
 
         divider2 = QFrame()
@@ -205,8 +226,27 @@ class LockScreen(QMainWindow):
         divider2.setObjectName("divider")
         card_layout.addWidget(divider2)
 
+        # Azkar row
         self.azkar_row = TaskRow("🌙", "Morning Azkar", "Open the image and read your Azkar")
         card_layout.addWidget(self.azkar_row)
+
+        divider3 = QFrame()
+        divider3.setFrameShape(QFrame.Shape.HLine)
+        divider3.setObjectName("divider")
+        card_layout.addWidget(divider3)
+
+        # Website row
+        mins = WEBSITE_TASK_DURATION_SEC // 60
+        secs = WEBSITE_TASK_DURATION_SEC % 60
+        dur_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+        self.web_row = TaskRow(
+            "📖", "Quran Recitation",
+            f"Open quran.com and recite for {dur_str}",
+            show_bar=True, bar_max=WEBSITE_TASK_DURATION_SEC
+        )
+        # Start bar full (drains to 0)
+        self.web_row.mini_bar.setValue(WEBSITE_TASK_DURATION_SEC)
+        card_layout.addWidget(self.web_row)
         card_layout.addSpacing(8)
 
         # Overall progress bar
@@ -216,7 +256,7 @@ class LockScreen(QMainWindow):
         progress_label.setFont(QFont("Consolas", 8))
         progress_label.setObjectName("barLabel")
         self.overall_bar = QProgressBar()
-        self.overall_bar.setRange(0, 2)
+        self.overall_bar.setRange(0, TOTAL_TASKS)
         self.overall_bar.setValue(0)
         self.overall_bar.setTextVisible(False)
         self.overall_bar.setFixedHeight(8)
@@ -258,6 +298,12 @@ class LockScreen(QMainWindow):
         self.azkar_btn.setFixedSize(200, 50)
         self.azkar_btn.clicked.connect(self._open_azkar)
 
+        self.web_btn = QPushButton("📖  Open Quran")
+        self.web_btn.setObjectName("webBtn")
+        self.web_btn.setFont(QFont("Consolas", 12, QFont.Weight.Bold))
+        self.web_btn.setFixedSize(200, 50)
+        self.web_btn.clicked.connect(self._open_website)
+
         unlock_btn = QPushButton("🔓  Emergency Unlock")
         unlock_btn.setObjectName("unlockBtn")
         unlock_btn.setFont(QFont("Consolas", 10))
@@ -266,6 +312,7 @@ class LockScreen(QMainWindow):
 
         btn_row.addWidget(self.anki_btn)
         btn_row.addWidget(self.azkar_btn)
+        btn_row.addWidget(self.web_btn)
         btn_row.addWidget(unlock_btn)
         root.addLayout(btn_row)
         root.addSpacing(20)
@@ -292,23 +339,32 @@ class LockScreen(QMainWindow):
         root.addWidget(footer)
         root.addSpacing(16)
 
-    # ── Watcher ───────────────────────────────
-    def _start_watcher(self):
+    # ── Watchers ──────────────────────────────
+    def _start_watchers(self):
         self._tasks_done    = 0
         self._anki_done     = False
         self._azkar_done    = False
+        self._web_done      = False
+        self._web_active    = False   # True while watcher is running
         self._soft_unlocked = False
         self._hard_unlocked = False
 
+        # Anki watcher
         self.watcher = AnkiWatcher()
         self.watcher.progress_update.connect(self._on_progress)
         self.watcher.task_complete.connect(self._on_anki_complete)
         self.watcher.already_done.connect(self._on_already_done)
         self.watcher.start()
 
+        # Azkar — check if already done today
         if azkar_done_today():
             print("[Azkar] already done today — pre-ticking")
             QTimer.singleShot(0, self._on_azkar_already_done)
+
+        # Website — check if already done today
+        if website_done_today():
+            print("[Website] already done today — pre-ticking")
+            QTimer.singleShot(0, self._on_web_already_done)
 
     def _refresh_streak_label(self):
         streak = calculate_streak()
@@ -343,11 +399,19 @@ class LockScreen(QMainWindow):
 
     # ── Azkar callbacks ───────────────────────
     def _on_azkar_already_done(self):
-        """Called on startup when Azkar was already completed today."""
-        self._on_azkar_complete()
+        self._azkar_done = True
+        self.azkar_row.mark_done()
+        self.azkar_btn.setText("✓  Azkar Done")
+        self.azkar_btn.setObjectName("azkarBtnDone")
+        self.azkar_btn.style().unpolish(self.azkar_btn)
+        self.azkar_btn.style().polish(self.azkar_btn)
+        self.azkar_btn.clicked.disconnect()
+        self.azkar_btn.clicked.connect(self._untick_azkar)
+        self._tasks_done += 1
+        self.overall_bar.setValue(self._tasks_done)
+        self._check_all_complete()
 
     def _on_azkar_complete(self):
-        """Called when Azkar image viewer is closed."""
         if self._azkar_done:
             return
         self._azkar_done = True
@@ -362,15 +426,31 @@ class LockScreen(QMainWindow):
         self._tasks_done += 1
         self.overall_bar.setValue(self._tasks_done)
         self._check_all_complete()
+        self.raise_()
+        self.activateWindow()
+        self.show()
 
     def _untick_azkar(self):
-        """Allow user to manually undo the Azkar tick."""
         if not self._azkar_done:
             return
         self._azkar_done = False
+        from core import unmark_azkar_done
         unmark_azkar_done()
         self._tasks_done = max(0, self._tasks_done - 1)
         self.overall_bar.setValue(self._tasks_done)
+
+        if self._soft_unlocked:
+            self._soft_unlocked = False
+            self._hard_unlocked = False
+            self._altf4_allowed = False
+            install_hook()
+            threading.Thread(target=pump_messages, daemon=True).start()
+            self.title_label.setText("SYSTEM LOCKED")
+            self.title_label.setObjectName("titleLabel")
+            self.title_label.style().unpolish(self.title_label)
+            self.title_label.style().polish(self.title_label)
+            self.enter_btn.setVisible(False)
+
         self.azkar_row.status_label.setText("PENDING")
         self.azkar_row.status_label.setObjectName("statusPending")
         self.azkar_row.status_label.style().unpolish(self.azkar_row.status_label)
@@ -386,9 +466,55 @@ class LockScreen(QMainWindow):
         self.azkar_btn.clicked.disconnect()
         self.azkar_btn.clicked.connect(self._open_azkar)
 
+    # ── Website callbacks ─────────────────────
+    def _on_web_already_done(self):
+        if self._web_done:
+            return
+        self._web_done = True
+        self.web_row.mark_done()
+        self.web_row.desc_label.setText("Completed earlier today ✓")
+        self.web_btn.setText("✓  Quran Done")
+        self.web_btn.setObjectName("webBtnDone")
+        self.web_btn.style().unpolish(self.web_btn)
+        self.web_btn.style().polish(self.web_btn)
+        self.web_btn.setEnabled(False)
+        self._tasks_done += 1
+        self.overall_bar.setValue(self._tasks_done)
+        self._check_all_complete()
+
+    def _on_web_tick(self, remaining: int):
+        self.web_row.update_countdown(remaining, WEBSITE_TASK_DURATION_SEC)
+
+    def _on_web_complete(self):
+        if self._web_done:
+            return
+        self._web_done   = True
+        self._web_active = False
+        mark_website_done()
+        self.web_row.mark_done()
+        self.web_row.desc_label.setText("Recitation complete ✓")
+        self.web_btn.setText("✓  Quran Done")
+        self.web_btn.setObjectName("webBtnDone")
+        self.web_btn.style().unpolish(self.web_btn)
+        self.web_btn.style().polish(self.web_btn)
+        self.web_btn.setEnabled(False)
+        self._tasks_done += 1
+        self.overall_bar.setValue(self._tasks_done)
+        self._check_all_complete()
+        self.raise_()
+        self.activateWindow()
+        self.show()
+
+    def _on_web_error(self, msg: str):
+        print(f"[Website] Error: {msg}")
+        self.web_row.desc_label.setText(f"⚠  {msg}")
+
     # ── Unlock logic ──────────────────────────
     def _check_all_complete(self):
-        if self._tasks_done >= 1 and not self._soft_unlocked:
+        if self._tasks_done >= 1:
+            self._altf4_allowed = True
+
+        if self._tasks_done >= TOTAL_TASKS and not self._soft_unlocked:
             self._soft_unlocked = True
             mark_today_complete()
             self._refresh_streak_label()
@@ -398,9 +524,6 @@ class LockScreen(QMainWindow):
             self.title_label.setObjectName("titleUnlocked")
             self.title_label.style().unpolish(self.title_label)
             self.title_label.style().polish(self.title_label)
-
-        if self._tasks_done >= 2 and not self._hard_unlocked:
-            self._hard_unlocked = True
             QTimer.singleShot(600, self._show_enter_button)
 
     def _show_enter_button(self):
@@ -430,13 +553,32 @@ class LockScreen(QMainWindow):
             print(f"[Azkar] open error: {e}")
             self.azkar_row.desc_label.setText(f"⚠  Could not open image: {e}")
 
+    def _open_website(self):
+        if self._web_done or self._web_active:
+            return
+        self._web_active = True
+
+        # Disable button while active so user can't double-launch
+        self.web_btn.setText("⏳  Reciting...")
+        self.web_btn.setObjectName("webBtnActive")
+        self.web_btn.style().unpolish(self.web_btn)
+        self.web_btn.style().polish(self.web_btn)
+        self.web_btn.setEnabled(False)
+
+        self.web_row.desc_label.setText("Starting timer & network lock...")
+
+        self._web_watcher = WebsiteWatcher()
+        self._web_watcher.task_complete.connect(self._on_web_complete)
+        self._web_watcher.tick.connect(self._on_web_tick)
+        self._web_watcher.error.connect(self._on_web_error)
+        self._web_watcher.start()
+
     def _raise_viewer_window(self, hwnd: int):
-        """Bring the image viewer above the lock screen."""
         try:
-            our_hwnd   = int(self.winId())
-            SW_SHOW    = 5
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
+            our_hwnd       = int(self.winId())
+            SW_SHOW        = 5
+            SWP_NOMOVE     = 0x0002
+            SWP_NOSIZE     = 0x0001
             SWP_NOACTIVATE = 0x0010
             ctypes.windll.user32.ShowWindow(hwnd, SW_SHOW)
             ctypes.windll.user32.SetWindowPos(
@@ -449,6 +591,15 @@ class LockScreen(QMainWindow):
             print(f"[Azkar] raise error: {e}")
 
     def _open_anki(self):
+        existing = self._find_anki_hwnd_by_title()
+        if existing:
+            self._force_foreground(existing)
+            self._anki_proc = None
+            self._enforce_timer = QTimer(self)
+            self._enforce_timer.timeout.connect(self._enforce_z_order_by_title)
+            self._enforce_timer.start(500)
+            return
+
         self._anki_proc = None
         try:
             self._anki_proc = subprocess.Popen([ANKI_PATH])
@@ -457,12 +608,53 @@ class LockScreen(QMainWindow):
                 self._anki_proc = subprocess.Popen(["anki"])
             except Exception:
                 return
+
         self._enforce_timer = QTimer(self)
         self._enforce_timer.timeout.connect(self._enforce_z_order)
         self._enforce_timer.start(500)
 
+    def _find_anki_hwnd_by_title(self):
+        found = []
+        def cb(hwnd, _):
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                    if "Anki" in buf.value:
+                        found.append(hwnd)
+            return True
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        ctypes.windll.user32.EnumWindows(WNDENUMPROC(cb), 0)
+        return found[0] if found else None
+
+    def _force_foreground(self, hwnd: int):
+        SW_RESTORE = 9
+        ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+        our_tid    = ctypes.windll.kernel32.GetCurrentThreadId()
+        target_tid = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, None)
+        ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, True)
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        ctypes.windll.user32.AttachThreadInput(our_tid, target_tid, False)
+
+    def _enforce_z_order_by_title(self):
+        if self._soft_unlocked:
+            self._enforce_timer.stop()
+            return
+        hwnd = self._find_anki_hwnd_by_title()
+        if not hwnd:
+            return
+        foreground = ctypes.windll.user32.GetForegroundWindow()
+        if foreground != hwnd:
+            return
+        SWP_NOMOVE = 0x0002; SWP_NOSIZE = 0x0001; SWP_NOACTIVATE = 0x0010
+        our_hwnd = int(self.winId())
+        ctypes.windll.user32.SetWindowPos(
+            our_hwnd, hwnd, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        )
+
     def _find_anki_hwnd(self):
-        """Find Anki's main window by matching its exact process PID."""
         if not self._anki_proc:
             return None
         target_pid = self._anki_proc.pid
@@ -482,7 +674,6 @@ class LockScreen(QMainWindow):
         return found[0] if found else None
 
     def _enforce_z_order(self):
-        """Place our window just below Anki — only when Anki is in the foreground."""
         if self._soft_unlocked:
             if hasattr(self, '_enforce_timer'):
                 self._enforce_timer.stop()
@@ -506,9 +697,11 @@ class LockScreen(QMainWindow):
             print(f"[Z-order] {e}")
 
     def _unlock(self):
-        """Emergency unlock — force quit regardless of task state."""
         self._soft_unlocked = True
         self.watcher.stop()
+        # Stop website watcher if active
+        if self._web_active and hasattr(self, '_web_watcher'):
+            self._web_watcher.stop()
         remove_hook()
         QApplication.quit()
 
@@ -524,7 +717,7 @@ class LockScreen(QMainWindow):
 
     # ── Prevent close / minimize ──────────────
     def closeEvent(self, event):
-        if self._soft_unlocked:
+        if self._soft_unlocked or getattr(self, '_altf4_allowed', False):
             event.accept()
         else:
             event.ignore()
@@ -656,6 +849,38 @@ class LockScreen(QMainWindow):
                 color: #e53e3e;
             }
             #unlockBtn:pressed { background-color: #1a0a0a; }
+
+            /* Website button — idle */
+            #webBtn {
+                background-color: #0d2a3a;
+                color: #63b3ed;
+                border: 1px solid #1e4a6a;
+                border-radius: 8px;
+                letter-spacing: 1px;
+            }
+            #webBtn:hover {
+                background-color: #1a3f5c;
+                border-color: #3182ce;
+            }
+            #webBtn:pressed { background-color: #0a1e2e; }
+
+            /* Website button — active (timer running) */
+            #webBtnActive {
+                background-color: #1a2a1a;
+                color: #68d391;
+                border: 1px solid #276749;
+                border-radius: 8px;
+                letter-spacing: 1px;
+            }
+
+            /* Website button — done */
+            #webBtnDone {
+                background-color: #0d1a14;
+                color: #00ff88;
+                border: 1px solid #00ff88;
+                border-radius: 8px;
+                letter-spacing: 1px;
+            }
 
             #footer {
                 color: #1a2030;

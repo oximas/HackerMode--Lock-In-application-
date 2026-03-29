@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import ctypes
+import socket
 import winreg
 import threading
 from ctypes import wintypes
@@ -19,15 +20,19 @@ from PyQt6.QtCore import QThread, pyqtSignal
 # ─────────────────────────────────────────────
 #  CONFIG  (edit these)
 # ─────────────────────────────────────────────
-REQUIRED_REVIEWS = 10         # cards reviewed today to unlock
-POLL_INTERVAL_MS = 5000       # how often to check Anki (ms)
-APP_NAME         = "HackerMode"
-ANKI_PATH        = r"C:\Users\Mega Store\AppData\Local\Programs\Anki\anki.exe"
-PLAY_SOUND       = True       # set False to disable victory sound
+REQUIRED_REVIEWS          = 10            # cards reviewed today to unlock
+POLL_INTERVAL_MS          = 5000          # how often to check Anki (ms)
+APP_NAME                  = "HackerMode"
+ANKI_PATH                 = r"C:\Users\Mega Store\AppData\Local\Programs\Anki\anki.exe"
+PLAY_SOUND                = True          # set False to disable victory sound
 
 # Azkar task config
 AZKAR_SOURCE_PATH = r"C:\Users\Mega Store\Desktop\اذكار الصباح.jpg"
 AZKAR_LOCAL_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "azkar.jpg")
+
+# Website task config
+WEBSITE_URL               = "https://quran.com/"   # site to open and lock into
+WEBSITE_TASK_DURATION_SEC = 30                      # seconds (change to e.g. 1200 for real use)
 
 # Persistence
 STREAK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streak_data.json")
@@ -79,9 +84,9 @@ def pump_messages():
 # ─────────────────────────────────────────────
 #  STARTUP REGISTRATION
 # ─────────────────────────────────────────────
-def register_startup():
-    exe    = sys.executable
-    script = os.path.abspath(__file__)
+def register_startup(script_path: str = None):
+    exe    = sys.executable.replace("python.exe", "pythonw.exe")
+    script = script_path or os.path.abspath(__file__)
     value  = f'"{exe}" "{script}"'
     try:
         key = winreg.OpenKey(
@@ -138,8 +143,6 @@ def get_reviews_today(db_path: str) -> int:
             day_start -= timedelta(days=1)
         day_start_ms = int(day_start.timestamp() * 1000)
 
-        # Copy .anki2 + .anki2-wal + .anki2-shm into a temp dir together.
-        # All three must be copied as a unit so the snapshot is consistent.
         tmp_dir = tempfile.mkdtemp()
         tmp_db  = os.path.join(tmp_dir, "col.anki2")
         shutil.copy2(db_path, tmp_db)
@@ -149,11 +152,7 @@ def get_reviews_today(db_path: str) -> int:
                 shutil.copy2(src, tmp_db + ext)
 
         try:
-            # Open read-write so PRAGMA wal_checkpoint is allowed.
             conn = sqlite3.connect(tmp_db, timeout=2)
-            # Merge any pending WAL frames into the main DB copy.
-            # Without this, reviews in the WAL since the last Anki sync
-            # are invisible to the query.
             conn.execute("PRAGMA wal_checkpoint(FULL)")
             count = conn.execute(
                 "SELECT COUNT(*) FROM revlog WHERE id >= ?", (day_start_ms,)
@@ -223,6 +222,17 @@ def unmark_azkar_done():
         save_streak_data(data)
         print(f"[Azkar] unmarked for {_today_str()}")
 
+def website_done_today() -> bool:
+    """Return True if website task was already completed today."""
+    return load_streak_data().get("website_last_done") == _today_str()
+
+def mark_website_done():
+    """Persist today's website task completion."""
+    data = load_streak_data()
+    data["website_last_done"] = _today_str()
+    save_streak_data(data)
+    print(f"[Website] marked done for {_today_str()}")
+
 def mark_today_complete():
     """Mark today as a completed day and return current streak count."""
     data  = load_streak_data()
@@ -243,6 +253,184 @@ def calculate_streak(data: dict = None) -> int:
         streak += 1
         day -= timedelta(days=1)
     return streak
+
+
+# ─────────────────────────────────────────────
+#  WEBSITE DOMAIN HELPERS
+# ─────────────────────────────────────────────
+def _extract_domain(url: str) -> str:
+    """Pull bare hostname from a URL string."""
+    # strip scheme
+    host = url.split("//")[-1]
+    # strip path
+    host = host.split("/")[0]
+    # strip port
+    host = host.split(":")[0]
+    return host.lower()
+
+def resolve_domain_ips(domain: str) -> set:
+    """
+    Resolve all IPs for a domain (A records only).
+    Returns a set of IP strings like {"104.21.0.1", ...}.
+    Falls back to empty set on failure — watcher will skip blocking gracefully.
+    """
+    try:
+        infos = socket.getaddrinfo(domain, None)
+        ips   = {info[4][0] for info in infos}
+        print(f"[Website] Resolved {domain} → {ips}")
+        return ips
+    except Exception as e:
+        print(f"[Website] DNS resolve failed for {domain}: {e}")
+        return set()
+
+# Additional IPs/domains to always allow through the firewall.
+# We resolve these at watcher start alongside the target domain.
+WHITELIST_DOMAINS = ["ankiweb.net"]
+
+
+# ─────────────────────────────────────────────
+#  WEBSITE WATCHER
+# ─────────────────────────────────────────────
+class WebsiteWatcher(QThread):
+    """
+    1. Opens WEBSITE_URL in the default browser.
+    2. Activates pydivert to block all outbound TCP/UDP except:
+       - target domain IPs
+       - WHITELIST_DOMAINS IPs
+       - localhost / 127.x / ::1
+       - DNS (port 53) — so resolution still works
+    3. Counts down WEBSITE_TASK_DURATION_SEC seconds, emitting
+       tick(remaining) every second so the UI can update.
+    4. On countdown end: stops blocking, emits task_complete.
+    5. stop() can be called externally (emergency unlock) to
+       tear down the filter immediately.
+    """
+    task_complete = pyqtSignal()
+    tick          = pyqtSignal(int)   # remaining seconds
+    error         = pyqtSignal(str)   # if pydivert unavailable
+
+    def __init__(self):
+        super().__init__()
+        self._running  = True
+        self._handle   = None   # pydivert handle — kept so stop() can close it
+
+    # ── helpers ──────────────────────────────
+    def _build_allowed_ips(self) -> set:
+        target_domain = _extract_domain(WEBSITE_URL)
+        allowed = resolve_domain_ips(target_domain)
+        for d in WHITELIST_DOMAINS:
+            allowed |= resolve_domain_ips(d)
+        print(f"[Website] Allowed IP set: {allowed}")
+        return allowed
+
+    @staticmethod
+    def _is_local(ip: str) -> bool:
+        return (
+            ip.startswith("127.")
+            or ip == "::1"
+            or ip.startswith("169.254.")   # link-local
+            or ip.startswith("10.")
+            or ip.startswith("192.168.")
+        )
+
+    # ── main thread ──────────────────────────
+    def run(self):
+        import time, webbrowser
+
+        # Open the site
+        webbrowser.open(WEBSITE_URL)
+        print(f"[Website] Opened {WEBSITE_URL}")
+
+        # Try to import pydivert — emit error signal and complete
+        # gracefully if it's not available / not running as admin.
+        try:
+            import pydivert
+        except ImportError:
+            self.error.emit("pydivert not installed — run: pip install pydivert")
+            self._countdown_only()
+            return
+
+        allowed_ips = self._build_allowed_ips()
+
+        # pydivert filter: intercept ALL outbound TCP + UDP packets.
+        # We re-inject allowed ones and drop the rest.
+        # DNS (port 53) is excluded from interception so resolution works.
+        divert_filter = (
+            "(tcp.DstPort != 53 and udp.DstPort != 53) "
+            "and outbound "
+            "and not loopback"
+        )
+
+        try:
+            self._handle = pydivert.WinDivert(divert_filter)
+            self._handle.open()
+            print("[Website] pydivert filter active")
+        except Exception as e:
+            self.error.emit(f"pydivert open failed: {e}")
+            self._countdown_only()
+            return
+
+        # Run packet loop + countdown concurrently.
+        # Packet loop runs in THIS thread; countdown in a tiny side-thread
+        # that sets _running=False and closes the handle when done.
+        countdown_done = threading.Event()
+
+        def _countdown():
+            remaining = WEBSITE_TASK_DURATION_SEC
+            while remaining > 0 and self._running:
+                self.tick.emit(remaining)
+                time.sleep(1)
+                remaining -= 1
+            if self._running:
+                # Natural expiry
+                self.tick.emit(0)
+                self._running = False
+                try:
+                    self._handle.close()
+                except Exception:
+                    pass
+            countdown_done.set()
+
+        t = threading.Thread(target=_countdown, daemon=True)
+        t.start()
+
+        # Packet loop — runs until handle is closed
+        try:
+            for packet in self._handle:
+                if not self._running:
+                    break
+                dst_ip = packet.dst_addr
+                if self._is_local(dst_ip) or dst_ip in allowed_ips:
+                    self._handle.send(packet)   # allow
+                else:
+                    pass                         # drop — don't re-inject
+        except Exception as e:
+            # Handle closed externally (stop() called) — normal shutdown path
+            print(f"[Website] pydivert loop ended: {e}")
+
+        countdown_done.wait(timeout=5)
+        print("[Website] filter removed — task complete")
+        self.task_complete.emit()
+
+    def _countdown_only(self):
+        """Fallback: just count down with no network blocking."""
+        import time
+        remaining = WEBSITE_TASK_DURATION_SEC
+        while remaining > 0 and self._running:
+            self.tick.emit(remaining)
+            time.sleep(1)
+            remaining -= 1
+        self.tick.emit(0)
+        self.task_complete.emit()
+
+    def stop(self):
+        """Called on emergency unlock — tears down filter immediately."""
+        self._running = False
+        if self._handle:
+            try:
+                self._handle.close()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────

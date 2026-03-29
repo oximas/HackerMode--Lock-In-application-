@@ -1,0 +1,2 @@
+@echo off
+powershell -Command "Start-Process 'C:\Python314\python.exe' -ArgumentList '\"C:\Users\Mega Store\Desktop\LockIn\hacker_mode.py\"' -Verb RunAs -WorkingDirectory 'C:\Users\Mega Store\Desktop\LockIn'"
